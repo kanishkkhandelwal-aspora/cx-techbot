@@ -103,6 +103,10 @@ Handler.handle()
 - Claude outputs structured `[ROOT_CAUSE]` and `[CX_ADVICE]` sections with bullet points
 - `parse_structured_analysis()` parses into `{"root_cause": "...", "cx_advice": "..."}`
 - max_tokens: 400 (KYC), 350 (general)
+- Smart line selection to stay within token budget:
+  - Each line truncated to 2000 chars (KYC logs have huge JSON/base64 bodies)
+  - Error lines prioritized over generic INFO lines (using `ERROR_PATTERNS`)
+  - Max 60 lines, max 120k total chars (~30k tokens)
 
 ### Handler (`handler.py`)
 - `handle()` → routes: `is_bot_mention` → `_handle_direct_search()`, else → `_handle_classify()`
@@ -239,6 +243,7 @@ pkill -f "main.py"; sleep 1 && rm -f .cxbot_cursor cxbot_assigner_state.json && 
 - Added `_handle_direct_search()`, `_get_ids_from_parent()` in handler
 - Progressive verification-service search window (48h → 7d → 14d) for KYC
 - Handler fallback: helpful Root Cause / CX Advice when CloudWatch returns 0 results
+- Smart line selection in `analyze_logs_with_claude()`: truncate lines to 2000 chars, prioritize error lines, cap at 60 lines / 120k chars (fixes 200k token overflow on large KYC logs)
 - Initial commit pushed to GitHub
 
 ### 2026-03-13

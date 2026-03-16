@@ -169,8 +169,48 @@ def analyze_logs_with_claude(
     if not log_lines:
         return ""
 
-    # Limit to 50 most relevant lines to stay within token budget
-    lines_to_analyze = log_lines[:50]
+    # ─── Smart line selection to stay within token budget ─────────────
+    # Problem: KYC logs can have huge JSON response bodies (base64 data etc.)
+    # that blow past the 200k token limit even with 50 lines.
+    #
+    # Strategy:
+    # 1. Truncate each line to 2000 chars max
+    # 2. Prioritize error/status lines over generic INFO lines
+    # 3. Cap total text at ~120k chars (~30k tokens, safe with prompt overhead)
+    MAX_LINE_LEN = 2000
+    MAX_TOTAL_CHARS = 120_000
+    MAX_LINES = 60
+
+    # Import error patterns to identify high-value lines
+    from cloudwatch.log_searcher import ERROR_PATTERNS
+
+    truncated = [line[:MAX_LINE_LEN] for line in log_lines]
+
+    # Split into error lines and other lines
+    error_lines = []
+    other_lines = []
+    for line in truncated:
+        if any(p.search(line) for p in ERROR_PATTERNS):
+            error_lines.append(line)
+        else:
+            other_lines.append(line)
+
+    # Build final list: errors first, then pad with other lines
+    lines_to_analyze = error_lines[:MAX_LINES]
+    remaining_slots = MAX_LINES - len(lines_to_analyze)
+    if remaining_slots > 0:
+        lines_to_analyze.extend(other_lines[:remaining_slots])
+
+    # Cap total character count
+    final_lines = []
+    total_chars = 0
+    for line in lines_to_analyze:
+        if total_chars + len(line) > MAX_TOTAL_CHARS:
+            break
+        final_lines.append(line)
+        total_chars += len(line)
+
+    lines_to_analyze = final_lines
     log_text = "\n".join(lines_to_analyze)
 
     # Use KYC-specific prompt for KYC category (includes rejection reasons KB)
