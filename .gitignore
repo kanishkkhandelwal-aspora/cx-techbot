@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.cxbot_cursor
+cxbot_metrics.db
+cxbot_assigner_state.json
+*.db-journal
+.venv/
+.DS_Store
