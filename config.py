@@ -22,6 +22,10 @@ class Config:
     aws_secret_access_key: str = ""
     aws_session_token: str = ""
     cw_goblin_log_group: str = "/ecs/vance-core/prod/london/01/goblin-service-logs"
+    # Databricks SQL warehouse
+    databricks_server_hostname: str = ""
+    databricks_http_path: str = ""
+    databricks_access_token: str = ""
 
 
 def load_config() -> Config:
@@ -61,4 +65,8 @@ def load_config() -> Config:
         aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", ""),
         aws_session_token=os.getenv("AWS_SESSION_TOKEN", ""),
         cw_goblin_log_group=os.getenv("CW_GOBLIN_LOG_GROUP", "/ecs/vance-core/prod/london/01/goblin-service-logs"),
+        # Databricks
+        databricks_server_hostname=os.getenv("DATABRICKS_SERVER_HOSTNAME", ""),
+        databricks_http_path=os.getenv("DATABRICKS_HTTP_PATH", ""),
+        databricks_access_token=os.getenv("DATABRICKS_ACCESS_TOKEN", ""),
     )

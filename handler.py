@@ -1,7 +1,15 @@
-"""Glue module: classify -> investigate -> analyze -> assign -> format -> post -> record."""
+"""Glue module: classify -> investigate (CW + DB in parallel) -> synthesize -> assign -> format -> post -> record.
+
+Multi-agent architecture:
+  Agent 1: CloudWatch log searcher (unstructured logs)
+  Agent 2: Databricks SQL searcher (structured DB records)
+  Parent:  Claude synthesizer (merges both inputs into root cause + CX advice)
+"""
 
 import logging
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import anthropic
 
@@ -16,6 +24,7 @@ from cloudwatch.log_searcher import (
     CloudWatchSearcher, INVESTIGATE_CATEGORIES, SERVICE_ALIASES, SERVICE_DISPLAY_NAMES,
 )
 from cloudwatch.log_analyzer import analyze_logs_with_claude, parse_structured_analysis
+from db_agent.db_searcher import DatabricksSearcher, INVESTIGATE_CATEGORIES as DB_INVESTIGATE_CATEGORIES
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +36,7 @@ class Handler:
     def __init__(self, classifier: CXClassifier, assigner: Assigner,
                  metrics_db: MetricsDB, poller: Poller | None,
                  cw_searcher: CloudWatchSearcher | None = None,
+                 db_searcher: DatabricksSearcher | None = None,
                  anthropic_client: anthropic.Anthropic | None = None,
                  classifier_model: str = "claude-haiku-4-5-20251001"):
         self.classifier = classifier
@@ -34,6 +44,7 @@ class Handler:
         self.metrics = metrics_db
         self.poller = poller
         self.cw_searcher = cw_searcher
+        self.db_searcher = db_searcher
         self.anthropic_client = anthropic_client
         self.classifier_model = classifier_model
 
@@ -46,6 +57,8 @@ class Handler:
     def _handle_classify(self, msg: SlackMessage):
         """Classify -> Investigate -> Analyze -> Assign -> Post single response -> Record."""
         try:
+            start_time = time.monotonic()
+
             # 1. Classify
             result = self.classifier.classify(msg.text)
 
@@ -58,55 +71,105 @@ class Handler:
             # 3. Assign
             assignment = self.assigner.assign(result.category, msg.timestamp)
 
-            # 4. CloudWatch investigation + Claude analysis (enabled categories only)
+            # 4. Multi-agent investigation: CloudWatch + Databricks in parallel
+            #    Agent 1: CloudWatch logs (unstructured)
+            #    Agent 2: Databricks SQL (structured)
+            #    Parent: Claude synthesizer
             analysis = None
+            investigation = None
+            db_investigation = None
             services_searched = []
-            category_enabled = result.category in INVESTIGATE_CATEGORIES
+            data_sources = []  # Track which sources provided data
+            cw_enabled = result.category in INVESTIGATE_CATEGORIES
+            db_enabled = result.category in DB_INVESTIGATE_CATEGORIES
 
-            if self.cw_searcher and category_enabled and not is_triage:
-                investigation = self._investigate(msg, result)
+            if not is_triage and (
+                (self.cw_searcher and cw_enabled) or (self.db_searcher and db_enabled)
+            ):
+                investigation, db_investigation = self._investigate_parallel(
+                    msg, result, cw_enabled, db_enabled,
+                )
+
+                # Collect services searched from CloudWatch
                 if investigation:
                     services_searched = investigation.services_searched
-                    # Parse Claude's structured response into sections
-                    if investigation.analyzed_reason:
-                        analysis = parse_structured_analysis(investigation.analyzed_reason)
-                    else:
-                        # No logs found or Claude not invoked — build a helpful
-                        # fallback so the formatter still shows Root Cause / CX Advice.
-                        total_lines = sum(
-                            s.total_results for s in investigation.search_steps
-                        )
-                        if total_lines == 0:
-                            svc_list = ", ".join(services_searched) if services_searched else "CloudWatch"
-                            if result.category == "kyc_verification":
-                                analysis = {
-                                    "root_cause": (
-                                        f"• No logs found for the provided user ID "
-                                        f"in {svc_list} (last 48 hours).\n"
-                                        f"• This could mean the user hasn't initiated "
-                                        f"the KYC/verification flow yet, or the user ID "
-                                        f"may be incorrect."
-                                    ),
-                                    "cx_advice": (
-                                        "• Verify the user ID is correct.\n"
-                                        "• Ask the customer to retry the verification flow.\n"
-                                        "• If the issue persists, escalate to the assigned engineer."
-                                    ),
-                                }
-                            else:
-                                analysis = {
-                                    "root_cause": (
-                                        f"• No logs found for the provided IDs "
-                                        f"in {svc_list} (last 48 hours).\n"
-                                        f"• The transaction may not have reached the "
-                                        f"backend, or the IDs may be incorrect."
-                                    ),
-                                    "cx_advice": (
-                                        "• Verify the IDs provided are correct.\n"
-                                        "• Ask the customer to retry the transaction.\n"
-                                        "• If the issue persists, escalate to the assigned engineer."
-                                    ),
-                                }
+
+                # Collect data sources
+                if investigation and any(s.total_results > 0 for s in investigation.search_steps):
+                    data_sources.append("CloudWatch")
+                if db_investigation and db_investigation.has_data:
+                    data_sources.append("Databricks")
+
+                # Get log lines + DB summary for Claude synthesis
+                all_log_lines = []
+                db_summary = ""
+
+                if investigation:
+                    for step in investigation.search_steps:
+                        all_log_lines.extend(step.all_lines)
+
+                if db_investigation and db_investigation.has_data:
+                    db_summary = db_investigation.summary_text
+
+                # Run Claude synthesis (Parent Agent)
+                if (all_log_lines or db_summary) and self.anthropic_client:
+                    context = (
+                        f"Category: {result.category}\n"
+                        f"Original CX query: {msg.text[:300]}\n"
+                        f"Data sources: {', '.join(data_sources) if data_sources else 'none'}"
+                    )
+                    if investigation:
+                        context += f"\nServices searched: {', '.join(investigation.services_searched)}"
+
+                    analyzed = analyze_logs_with_claude(
+                        client=self.anthropic_client,
+                        log_lines=all_log_lines,
+                        model=self.classifier_model,
+                        context=context,
+                        category=result.category,
+                        db_summary=db_summary,
+                    )
+                    if analyzed:
+                        analysis = parse_structured_analysis(analyzed)
+                        logger.info(f"Claude synthesis: {analyzed[:150]}...")
+
+                # Fallback when no data from either source
+                if not analysis:
+                    has_cw_lines = investigation and sum(
+                        s.total_results for s in investigation.search_steps
+                    ) > 0
+                    has_db_data = db_investigation and db_investigation.has_data
+
+                    if not has_cw_lines and not has_db_data:
+                        # Extract IDs from classification for the fallback
+                        ids_str = ""
+                        if result.user_ids:
+                            ids_str = f"user_id: {result.user_ids[0]}"
+                        elif result.order_ids:
+                            ids_str = f"order_id: {result.order_ids[0]}"
+
+                        if result.category == "kyc_verification":
+                            analysis = {
+                                "root_cause": (
+                                    f"• No KYC record found for {ids_str or 'provided ID'} in database (searched up to 14 days).\n"
+                                    f"• User likely hasn't initiated the KYC flow yet."
+                                ),
+                                "cx_advice": (
+                                    "• Confirm with customer if they started the KYC process in the app.\n"
+                                    "• If yes, ask them to close and reopen the app, then retry KYC from scratch."
+                                ),
+                            }
+                        else:
+                            analysis = {
+                                "root_cause": (
+                                    f"• No transaction record found for {ids_str or 'provided ID'} in database (searched up to 14 days).\n"
+                                    f"• Payment likely didn't reach the backend — user may not have completed checkout."
+                                ),
+                                "cx_advice": (
+                                    "• Confirm with customer if the payment screen loaded and they entered card details.\n"
+                                    "• If amount was debited from bank, it will auto-reverse within 48h."
+                                ),
+                            }
 
             # 5. Format & post single combined response
             if is_triage:
@@ -118,20 +181,45 @@ class Handler:
                     analysis=analysis,
                     poster_user_id=msg.user,
                     services_searched=services_searched,
+                    data_sources=data_sources,
                 )
 
             self.poller.post_message(msg.channel, response, msg.timestamp)
 
-            # 6. Record to DB
-            self.metrics.record(msg, result, assignment)
+            # 6. Record to DB with enriched metrics
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
+
+            # Compute log/row counts for metrics
+            cw_log_lines = 0
+            if investigation:
+                cw_log_lines = sum(s.total_results for s in investigation.search_steps)
+            db_rows = 0
+            if db_investigation:
+                db_rows = sum(q.row_count for q in db_investigation.queries_run)
+
+            root_cause_summary = ""
+            if analysis and analysis.get("root_cause"):
+                root_cause_summary = analysis["root_cause"]
+
+            self.metrics.record(
+                msg, result, assignment,
+                response_time_ms=elapsed_ms,
+                data_sources=data_sources,
+                error_found=bool(investigation and investigation.error_found),
+                root_cause_summary=root_cause_summary,
+                services_searched=services_searched,
+                is_triage=is_triage,
+                cw_log_lines=cw_log_lines,
+                db_rows=db_rows,
+            )
 
             # 7. Mark done (eyes -> checkmark)
             self.poller.ack_done(msg.channel, msg.timestamp)
             self.poller.mark_done(msg.timestamp)
 
             logger.info(
-                "Handled message ts=%s category=%s assigned_to=%s confidence=%.2f",
-                msg.timestamp, result.category, assignment.engineer, result.confidence,
+                "Handled message ts=%s category=%s assigned_to=%s confidence=%.2f elapsed=%dms",
+                msg.timestamp, result.category, assignment.engineer, result.confidence, elapsed_ms,
             )
 
         except Exception as e:
@@ -301,20 +389,67 @@ class Handler:
             logger.error(f"Failed to fetch parent message: {e}")
         return []
 
-    # ─── Normal investigation flow ─────────────────────────────────────────
+    # ─── Multi-agent investigation flow ─────────────────────────────────────
 
-    def _investigate(self, msg: SlackMessage, classification: CXClassification):
-        """Run CloudWatch investigation + Claude analysis for any category.
+    def _investigate_parallel(self, msg, classification, cw_enabled, db_enabled):
+        """Run Agent 1 (CloudWatch) + Agent 2 (Databricks) in parallel.
 
-        Returns InvestigationResult or None on failure.
+        ALWAYS fires both agents concurrently via ThreadPoolExecutor.
+        If one agent has no searcher or isn't enabled, it's simply skipped.
+        Each agent has a 90s timeout to prevent blocking.
+
+        Returns (InvestigationResult | None, DBInvestigationResult | None).
         """
+        investigation = None
+        db_investigation = None
+
+        futures = {}
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="agent") as pool:
+            # Agent 1: CloudWatch
+            if self.cw_searcher and cw_enabled:
+                logger.info("[Parallel] Launching Agent 1 (CloudWatch)")
+                futures["cw"] = pool.submit(
+                    self._run_cw_investigation, msg, classification,
+                )
+            else:
+                logger.info("[Parallel] Agent 1 (CloudWatch) skipped — %s",
+                            "no searcher" if not self.cw_searcher else "category not enabled")
+
+            # Agent 2: Databricks
+            if self.db_searcher and db_enabled:
+                logger.info("[Parallel] Launching Agent 2 (Databricks)")
+                futures["db"] = pool.submit(
+                    self._run_db_investigation, classification,
+                )
+            else:
+                logger.info("[Parallel] Agent 2 (Databricks) skipped — %s",
+                            "no searcher" if not self.db_searcher else "category not enabled")
+
+            # Collect results — both should complete nearly simultaneously
+            for key, future in futures.items():
+                try:
+                    result = future.result(timeout=90)
+                    if key == "cw":
+                        investigation = result
+                    else:
+                        db_investigation = result
+                except Exception as e:
+                    logger.error(f"Agent {key} failed or timed out: {e}")
+
+        # Log parallel completion
+        cw_lines = sum(s.total_results for s in investigation.search_steps) if investigation else 0
+        db_rows = sum(q.row_count for q in db_investigation.queries_run) if db_investigation else 0
+        logger.info(f"[Parallel] Both agents done — CW: {cw_lines} lines, DB: {db_rows} rows")
+
+        return investigation, db_investigation
+
+    def _run_cw_investigation(self, msg, classification):
+        """Agent 1: CloudWatch log investigation."""
         try:
             logger.info(
-                f"Starting CloudWatch investigation for {msg.timestamp} "
+                f"[Agent 1/CW] Starting investigation for {msg.timestamp} "
                 f"(category={classification.category})"
             )
-
-            # Use the generic investigate() — it knows which log groups per category
             investigation = self.cw_searcher.investigate(
                 category=classification.category,
                 order_ids=classification.order_ids,
@@ -324,48 +459,38 @@ class Handler:
                 checkout_pay_ids=classification.checkout_pay_ids,
                 hours_back=48,
             )
-
-            # Use Claude to analyze the logs and extract the structured response
-            all_log_lines = []
-            if classification.category == "kyc_verification":
-                # For KYC, send ALL lines — the JSON response bodies contain
-                # status, rejection_reasons, rejection_count, kyc_provider etc.
-                # Claude needs the full picture to diagnose KYC issues.
-                for step in investigation.search_steps:
-                    all_log_lines.extend(step.all_lines)
-            else:
-                # For other categories, prioritize error lines
-                for step in investigation.search_steps:
-                    if step.error_lines:
-                        all_log_lines.extend(step.error_lines)
-                    elif step.all_lines:
-                        all_log_lines.extend(step.all_lines)
-
-            if all_log_lines and self.anthropic_client:
-                context = (
-                    f"Category: {classification.category}\n"
-                    f"Original CX query: {msg.text[:300]}\n"
-                    f"Services searched: {', '.join(investigation.services_searched)}"
-                )
-                analyzed = analyze_logs_with_claude(
-                    client=self.anthropic_client,
-                    log_lines=all_log_lines,
-                    model=self.classifier_model,
-                    context=context,
-                    category=classification.category,
-                )
-                investigation.analyzed_reason = analyzed
-                logger.info(f"Claude analysis: {analyzed[:150]}...")
-
+            total = sum(s.total_results for s in investigation.search_steps)
             logger.info(
-                f"Investigation complete for {msg.timestamp}: "
+                f"[Agent 1/CW] Done: {total} lines, "
                 f"error_found={investigation.error_found}, "
-                f"device_id={investigation.device_id}, "
-                f"services={investigation.services_searched}, "
-                f"steps={len(investigation.search_steps)}"
+                f"services={investigation.services_searched}"
             )
             return investigation
-
         except Exception as e:
-            logger.error(f"Investigation failed for {msg.timestamp}: {e}")
+            logger.error(f"[Agent 1/CW] Failed: {e}")
+            return None
+
+    def _run_db_investigation(self, classification):
+        """Agent 2: Databricks SQL investigation."""
+        try:
+            logger.info(
+                f"[Agent 2/DB] Starting investigation "
+                f"(category={classification.category})"
+            )
+            db_inv = self.db_searcher.investigate(
+                category=classification.category,
+                order_ids=classification.order_ids,
+                user_ids=classification.user_ids,
+                payment_attempt_ids=classification.payment_attempt_ids,
+                fulfillment_ids=classification.fulfillment_ids,
+                checkout_pay_ids=classification.checkout_pay_ids,
+            )
+            logger.info(
+                f"[Agent 2/DB] Done: has_data={db_inv.has_data}, "
+                f"tables={db_inv.tables_searched}, "
+                f"queries={len(db_inv.queries_run)}"
+            )
+            return db_inv
+        except Exception as e:
+            logger.error(f"[Agent 2/DB] Failed: {e}")
             return None

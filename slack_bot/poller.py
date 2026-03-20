@@ -12,7 +12,7 @@ from slack_sdk.errors import SlackApiError
 logger = logging.getLogger(__name__)
 
 MAX_SLACK_MSG_LEN = 39000
-RETRY_DELAYS = [1, 2, 4]  # seconds for 429 retries
+RETRY_DELAYS = [2, 5, 10]  # seconds for 429 retries (increased to avoid cascading)
 
 
 @dataclass
@@ -50,15 +50,30 @@ class Poller:
         self._init_cursor()
         logger.info(f"Poller started. Cursor: {self.last_ts}")
         poll_count = 0
+        consecutive_rate_limits = 0
         while True:
             try:
                 self._poll()
+                consecutive_rate_limits = 0  # Reset on success
             except Exception as e:
-                logger.error(f"Poll cycle error: {e}")
+                error_str = str(e).lower()
+                if "ratelimited" in error_str or "429" in error_str:
+                    consecutive_rate_limits += 1
+                    backoff = min(30 * consecutive_rate_limits, 120)
+                    logger.warning(
+                        f"Rate limited at poll level ({consecutive_rate_limits}x). "
+                        f"Backing off {backoff}s"
+                    )
+                    time.sleep(backoff)
+                    continue  # Skip thread scan this cycle
+                else:
+                    logger.error(f"Poll cycle error: {e}")
+                    consecutive_rate_limits = 0
 
-            # Every 2nd cycle, also scan threads for @bot mentions
+            # Scan threads for @bot mentions every 20th cycle (~5 min at 15s interval)
+            # Only if we're not in a rate-limit backoff state
             poll_count += 1
-            if poll_count % 2 == 0:
+            if poll_count % 20 == 0 and consecutive_rate_limits == 0:
                 try:
                     self._poll_thread_mentions()
                 except Exception as e:
@@ -187,11 +202,12 @@ class Poller:
         bot_mention_tag = f"<@{self.bot_user_id}>"
 
         try:
-            # Fetch recent top-level messages (last 10) that have replies
+            # Fetch recent top-level messages (last 5) that have replies
+            # Reduced from 10 to avoid Slack rate limits
             resp = self._slack_call(
                 lambda: self.client.conversations_history(
                     channel=self.channel_id,
-                    limit=10,
+                    limit=5,
                 )
             )
         except Exception as e:
@@ -207,12 +223,19 @@ class Poller:
 
             thread_ts = msg_data["ts"]
 
+            # Skip if we've already fully processed this thread recently
+            if thread_ts in self.completed:
+                continue
+
+            # Small delay between thread fetches to respect rate limits
+            time.sleep(1)
+
             try:
                 thread_resp = self._slack_call(
                     lambda t=thread_ts: self.client.conversations_replies(
                         channel=self.channel_id,
                         ts=t,
-                        limit=20,
+                        limit=10,  # Reduced from 20 to cut API calls
                     )
                 )
             except Exception as e:
@@ -366,12 +389,23 @@ class Poller:
         """Execute a Slack API call with retry on 429 (3 attempts)."""
         for attempt, delay in enumerate(RETRY_DELAYS):
             try:
-                return call_fn()
+                resp = call_fn()
+                # Check for non-exception rate limit responses
+                if isinstance(resp, dict) and resp.get("error") == "ratelimited":
+                    raise SlackApiError("Rate limited", resp)
+                return resp
             except SlackApiError as e:
-                if e.response.status_code == 429:
-                    retry_after = int(e.response.headers.get("Retry-After", delay))
+                error_str = str(e.response.get("error", "")) if hasattr(e, "response") else str(e)
+                is_rate_limited = (
+                    (hasattr(e.response, "status_code") and e.response.status_code == 429)
+                    or "ratelimited" in error_str
+                )
+                if is_rate_limited:
+                    retry_after = delay
+                    if hasattr(e.response, "headers"):
+                        retry_after = int(e.response.headers.get("Retry-After", delay))
                     logger.warning(
-                        f"Slack 429 rate limit (attempt {attempt + 1}/{len(RETRY_DELAYS)}), "
+                        f"Slack rate limit (attempt {attempt + 1}/{len(RETRY_DELAYS)}), "
                         f"retrying in {retry_after}s"
                     )
                     time.sleep(retry_after)

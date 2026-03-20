@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CX-Tech Bot Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+    <style>
+        :root {
+            --bg: #0f1117;
+            --card-bg: #1a1d27;
+            --border: #2a2d3a;
+            --text: #e4e6eb;
+            --text-dim: #8b8fa3;
+            --accent: #6366f1;
+            --accent-light: #818cf8;
+            --green: #22c55e;
+            --red: #ef4444;
+            --orange: #f59e0b;
+            --blue: #3b82f6;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 24px;
+            border-bottom: 1px solid var(--border);
+            background: var(--card-bg);
+        }
+
+        .header h1 {
+            font-size: 20px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .header .status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            color: var(--text-dim);
+        }
+
+        .header .status .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--green);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        .grid {
+            display: grid;
+            padding: 20px 24px;
+            gap: 16px;
+        }
+
+        /* ─── Stat cards row ─── */
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+        }
+
+        .stat-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 16px 20px;
+        }
+
+        .stat-card .label {
+            font-size: 12px;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        }
+
+        .stat-card .value {
+            font-size: 28px;
+            font-weight: 700;
+            line-height: 1.1;
+        }
+
+        .stat-card .unit {
+            font-size: 13px;
+            color: var(--text-dim);
+            margin-left: 4px;
+        }
+
+        /* ─── Charts ─── */
+        .charts-row {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 16px;
+        }
+
+        .chart-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 20px;
+        }
+
+        .chart-card h3 {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: var(--text-dim);
+        }
+
+        .chart-card canvas {
+            max-height: 250px;
+        }
+
+        /* ─── Bottom row ─── */
+        .bottom-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+
+        /* ─── Live feed ─── */
+        .feed-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 20px;
+            max-height: 420px;
+            overflow-y: auto;
+        }
+
+        .feed-card h3 {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            color: var(--text-dim);
+        }
+
+        .feed-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .feed-item:last-child { border-bottom: none; }
+
+        .feed-badge {
+            font-size: 10px;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 4px;
+            white-space: nowrap;
+            text-transform: uppercase;
+        }
+
+        .badge-payment { background: #dc262620; color: #ef4444; }
+        .badge-kyc { background: #f59e0b20; color: #f59e0b; }
+        .badge-db { background: #3b82f620; color: #3b82f6; }
+        .badge-referral { background: #22c55e20; color: #22c55e; }
+        .badge-bbps { background: #a855f720; color: #a855f7; }
+        .badge-manual { background: #6366f120; color: #6366f1; }
+        .badge-rate { background: #14b8a620; color: #14b8a6; }
+        .badge-app { background: #f4364c20; color: #f43f5e; }
+        .badge-triage { background: #64748b20; color: #94a3b8; }
+
+        .feed-text {
+            flex: 1;
+            font-size: 13px;
+            line-height: 1.4;
+        }
+
+        .feed-text .summary { color: var(--text); }
+        .feed-text .meta { color: var(--text-dim); font-size: 11px; margin-top: 2px; }
+
+        /* ─── Responsive ─── */
+        @media (max-width: 768px) {
+            .charts-row, .bottom-row { grid-template-columns: 1fr; }
+            .stats-row { grid-template-columns: repeat(2, 1fr); }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>CX-Tech Bot Dashboard</h1>
+        <div class="status">
+            <span class="dot"></span>
+            <span>Live — refreshes every 30s</span>
+            <span id="last-updated" style="margin-left: 12px;"></span>
+        </div>
+    </div>
+
+    <div class="grid">
+        <!-- ─── Stats row ─── -->
+        <div class="stats-row">
+            <div class="stat-card">
+                <div class="label">Today's Queries</div>
+                <div class="value" id="stat-today">—</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Total All Time</div>
+                <div class="value" id="stat-total">—</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Avg Response Time</div>
+                <div class="value" id="stat-rt">—<span class="unit">ms</span></div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Error Rate (Today)</div>
+                <div class="value" id="stat-error" style="color: var(--red);">—<span class="unit">%</span></div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Triage Rate (Today)</div>
+                <div class="value" id="stat-triage" style="color: var(--orange);">—<span class="unit">%</span></div>
+            </div>
+        </div>
+
+        <!-- ─── Charts ─── -->
+        <div class="charts-row">
+            <div class="chart-card">
+                <h3>Daily Query Volume (30 days)</h3>
+                <canvas id="dailyChart"></canvas>
+            </div>
+            <div class="chart-card">
+                <h3>Categories (7 days)</h3>
+                <canvas id="categoryChart"></canvas>
+            </div>
+        </div>
+
+        <!-- ─── Bottom row ─── -->
+        <div class="bottom-row">
+            <div class="chart-card">
+                <h3>Engineer Workload (7 days)</h3>
+                <canvas id="engineerChart"></canvas>
+            </div>
+            <div class="feed-card">
+                <h3>Recent Queries</h3>
+                <div id="feed"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ─── Chart instances ─────────────────────────────────────────────
+        let dailyChart, categoryChart, engineerChart;
+
+        const CATEGORY_COLORS = {
+            'payment_error_diagnosis': '#ef4444',
+            'kyc_verification': '#f59e0b',
+            'db_lookup_status': '#3b82f6',
+            'referral_promo': '#22c55e',
+            'bbps_partner_escalation': '#a855f7',
+            'manual_backend_action': '#6366f1',
+            'rate_fx_investigation': '#14b8a6',
+            'app_bug_engineering': '#f43f5e',
+            'other_needs_triage': '#94a3b8',
+        };
+
+        const CATEGORY_LABELS = {
+            'payment_error_diagnosis': 'Payment',
+            'kyc_verification': 'KYC',
+            'db_lookup_status': 'DB Lookup',
+            'referral_promo': 'Referral',
+            'bbps_partner_escalation': 'BBPS',
+            'manual_backend_action': 'Manual',
+            'rate_fx_investigation': 'Rate/FX',
+            'app_bug_engineering': 'App Bug',
+            'other_needs_triage': 'Triage',
+        };
+
+        const BADGE_CLASSES = {
+            'payment_error_diagnosis': 'badge-payment',
+            'kyc_verification': 'badge-kyc',
+            'db_lookup_status': 'badge-db',
+            'referral_promo': 'badge-referral',
+            'bbps_partner_escalation': 'badge-bbps',
+            'manual_backend_action': 'badge-manual',
+            'rate_fx_investigation': 'badge-rate',
+            'app_bug_engineering': 'badge-app',
+            'other_needs_triage': 'badge-triage',
+        };
+
+        Chart.defaults.color = '#8b8fa3';
+        Chart.defaults.borderColor = '#2a2d3a';
+
+        // ─── Fetch helpers ───────────────────────────────────────────────
+        async function fetchJSON(url) {
+            const r = await fetch(url);
+            return r.json();
+        }
+
+        // ─── Update stats cards ──────────────────────────────────────────
+        async function updateStats() {
+            const s = await fetchJSON('/api/stats');
+            document.getElementById('stat-today').textContent = s.today_queries;
+            document.getElementById('stat-total').textContent = s.total_queries.toLocaleString();
+            document.getElementById('stat-rt').innerHTML = s.avg_response_time_ms + '<span class="unit">ms</span>';
+            document.getElementById('stat-error').innerHTML = s.today_error_rate + '<span class="unit">%</span>';
+            document.getElementById('stat-triage').innerHTML = s.today_triage_rate + '<span class="unit">%</span>';
+        }
+
+        // ─── Daily volume chart ──────────────────────────────────────────
+        async function updateDailyChart() {
+            const data = await fetchJSON('/api/daily-volume');
+            const labels = data.map(d => {
+                const dt = new Date(d.date + 'T00:00:00');
+                return dt.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+            });
+            const values = data.map(d => d.count);
+
+            if (dailyChart) {
+                dailyChart.data.labels = labels;
+                dailyChart.data.datasets[0].data = values;
+                dailyChart.update();
+            } else {
+                dailyChart = new Chart(document.getElementById('dailyChart'), {
+                    type: 'bar',
+                    data: {
+                        labels,
+                        datasets: [{
+                            label: 'Queries',
+                            data: values,
+                            backgroundColor: '#6366f1',
+                            borderRadius: 4,
+                            barPercentage: 0.7,
+                        }],
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: {
+                            y: { beginAtZero: true, ticks: { precision: 0 } },
+                            x: { grid: { display: false } },
+                        },
+                    },
+                });
+            }
+        }
+
+        // ─── Category doughnut ───────────────────────────────────────────
+        async function updateCategoryChart() {
+            const data = await fetchJSON('/api/categories');
+            const labels = data.map(d => CATEGORY_LABELS[d.category] || d.category);
+            const values = data.map(d => d.count);
+            const colors = data.map(d => CATEGORY_COLORS[d.category] || '#64748b');
+
+            if (categoryChart) {
+                categoryChart.data.labels = labels;
+                categoryChart.data.datasets[0].data = values;
+                categoryChart.data.datasets[0].backgroundColor = colors;
+                categoryChart.update();
+            } else {
+                categoryChart = new Chart(document.getElementById('categoryChart'), {
+                    type: 'doughnut',
+                    data: {
+                        labels,
+                        datasets: [{
+                            data: values,
+                            backgroundColor: colors,
+                            borderWidth: 0,
+                            hoverOffset: 8,
+                        }],
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        cutout: '60%',
+                        plugins: {
+                            legend: {
+                                position: 'bottom',
+                                labels: { padding: 12, usePointStyle: true, pointStyleWidth: 8, font: { size: 11 } },
+                            },
+                        },
+                    },
+                });
+            }
+        }
+
+        // ─── Engineer workload ───────────────────────────────────────────
+        async function updateEngineerChart() {
+            const data = await fetchJSON('/api/engineers');
+            const labels = data.map(d => d.engineer);
+            const values = data.map(d => d.count);
+            const colors = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#3b82f6'];
+
+            if (engineerChart) {
+                engineerChart.data.labels = labels;
+                engineerChart.data.datasets[0].data = values;
+                engineerChart.update();
+            } else {
+                engineerChart = new Chart(document.getElementById('engineerChart'), {
+                    type: 'bar',
+                    data: {
+                        labels,
+                        datasets: [{
+                            label: 'Assigned',
+                            data: values,
+                            backgroundColor: colors,
+                            borderRadius: 6,
+                            barPercentage: 0.5,
+                        }],
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        indexAxis: 'y',
+                        plugins: { legend: { display: false } },
+                        scales: {
+                            x: { beginAtZero: true, ticks: { precision: 0 } },
+                            y: { grid: { display: false } },
+                        },
+                    },
+                });
+            }
+        }
+
+        // ─── Live feed ───────────────────────────────────────────────────
+        async function updateFeed() {
+            const data = await fetchJSON('/api/recent');
+            const feed = document.getElementById('feed');
+            feed.innerHTML = data.map(q => {
+                const badge = BADGE_CLASSES[q.category] || 'badge-triage';
+                const label = CATEGORY_LABELS[q.category] || q.category;
+                const time = q.classified_at ? new Date(q.classified_at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '';
+                const rt = q.response_time_ms ? `${(q.response_time_ms / 1000).toFixed(1)}s` : '';
+                const assignee = q.assigned_to || '';
+                const errorIcon = q.error_found ? ' <span style="color:#ef4444">&#9679;</span>' : '';
+                return `
+                    <div class="feed-item">
+                        <span class="feed-badge ${badge}">${label}</span>
+                        <div class="feed-text">
+                            <div class="summary">${escapeHtml(q.summary || 'No summary')}${errorIcon}</div>
+                            <div class="meta">${time} &middot; ${assignee}${rt ? ' &middot; ' + rt : ''}</div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        // ─── Refresh all ─────────────────────────────────────────────────
+        async function refreshAll() {
+            try {
+                await Promise.all([
+                    updateStats(),
+                    updateDailyChart(),
+                    updateCategoryChart(),
+                    updateEngineerChart(),
+                    updateFeed(),
+                ]);
+                document.getElementById('last-updated').textContent =
+                    'Updated ' + new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            } catch (e) {
+                console.error('Dashboard refresh error:', e);
+            }
+        }
+
+        // Initial load + auto-refresh every 30s
+        refreshAll();
+        setInterval(refreshAll, 30000);
+    </script>
+</body>
+</html>

@@ -179,7 +179,33 @@ class CloudWatchSearcher:
 
         self.session = boto3.Session(**session_kwargs)
         self.client = self.session.client("logs")
+        self._credentials_valid = True
         logger.info(f"CloudWatch searcher initialized (region={aws_region})")
+
+    def check_credentials(self) -> bool:
+        """Quick health check — try to describe a log group.
+
+        Returns False if AWS STS credentials are expired/invalid.
+        Call this on startup and periodically to detect expiry early.
+        """
+        try:
+            self.client.describe_log_groups(limit=1)
+            self._credentials_valid = True
+            return True
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            if error_code in ("ExpiredTokenException", "InvalidSignatureException",
+                              "UnrecognizedClientException", "ExpiredToken"):
+                logger.error(
+                    f"⚠ AWS credentials EXPIRED or invalid: {error_code}. "
+                    f"Update AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN in .env"
+                )
+                self._credentials_valid = False
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"AWS credential check failed: {e}")
+            return True  # Don't block on transient errors
 
     def investigate(self, category: str,
                     order_ids: list[str] = None,
@@ -394,66 +420,80 @@ class CloudWatchSearcher:
             investigation.summary = "No IDs (order, user, payment, etc.) found in the query to search CloudWatch."
             return investigation
 
+        # Progressive search windows: 48h → 7 days → 14 days
+        SEARCH_WINDOWS = [hours_back, 168, 336]
+
         # ─── Step 1: Search each log group with each ID ─────────────────
+        # Collect ALL results across services (don't return early on first error)
+        # so Claude has the full picture to give point-to-point answers.
         for log_group in log_groups:
             service_name = log_group.split("/")[-1].replace("-logs", "")
             investigation.services_searched.append(service_name)
 
             for id_type, search_term in search_terms:
-                logger.info(f"Searching {service_name} for {id_type}={search_term}")
-                result = self.search_logs(
-                    log_group=log_group,
-                    search_term=search_term,
-                    hours_back=hours_back,
-                )
+                # Try progressively wider windows until we find results
+                result = None
+                for window in SEARCH_WINDOWS:
+                    if window < hours_back:
+                        continue
+                    logger.info(f"Searching {service_name} for {id_type}={search_term} (window={window}h)")
+                    result = self.search_logs(
+                        log_group=log_group,
+                        search_term=search_term,
+                        hours_back=window,
+                        limit=200,
+                    )
+
+                    if result.total_results > 0:
+                        logger.info(f"Found {result.total_results} lines at {window}h window")
+                        break
+                    else:
+                        logger.info(f"0 results at {window}h window, widening...")
+
                 investigation.search_steps.append(result)
 
                 if result.has_errors:
                     investigation.error_found = True
                     investigation.root_cause = self._summarize_errors(result.error_lines)
-                    investigation.summary = (
-                        f"Errors found in {service_name} for {id_type}={search_term}"
-                    )
-                    if result.device_ids:
-                        investigation.device_id = result.device_ids[0]
                     logger.info(f"Errors found in {service_name}: {investigation.root_cause[:100]}")
-                    return investigation
 
-                if result.total_results > 0 and result.device_ids:
+                if result.total_results > 0 and result.device_ids and not investigation.device_id:
                     investigation.device_id = result.device_ids[0]
 
-        # ─── Step 2: device_id fallback search ──────────────────────────
+        # ─── Step 2: device_id fallback search (only if no errors yet) ──
         if investigation.device_id and not investigation.error_found:
             logger.info(f"Step 2: Searching with device_id={investigation.device_id}")
             for log_group in log_groups:
                 service_name = log_group.split("/")[-1].replace("-logs", "")
-                device_result = self.search_logs(
-                    log_group=log_group,
-                    search_term=investigation.device_id,
-                    hours_back=hours_back,
-                    limit=200,
-                )
+
+                device_result = None
+                for window in SEARCH_WINDOWS:
+                    if window < hours_back:
+                        continue
+                    device_result = self.search_logs(
+                        log_group=log_group,
+                        search_term=investigation.device_id,
+                        hours_back=window,
+                        limit=200,
+                    )
+                    if device_result.total_results > 0:
+                        break
+
                 investigation.search_steps.append(device_result)
 
                 if device_result.has_errors:
                     investigation.error_found = True
                     investigation.root_cause = self._summarize_errors(device_result.error_lines)
-                    investigation.summary = (
-                        f"Errors found in {service_name} via device_id={investigation.device_id}"
-                    )
-                    return investigation
+                    logger.info(f"Errors found in {service_name} via device_id: {investigation.root_cause[:100]}")
 
-            # Logs exist but no errors
-            total_lines = sum(s.total_results for s in investigation.search_steps)
-            investigation.summary = (
-                f"Found {total_lines} log lines across {', '.join(investigation.services_searched)} "
-                f"for device_id={investigation.device_id} but no clear errors."
-            )
-            return investigation
-
-        # ─── Nothing or logs with no errors ───────────────────────────────
+        # ─── Summarize ────────────────────────────────────────────────────
         total_lines = sum(s.total_results for s in investigation.search_steps)
-        if total_lines > 0:
+        if investigation.error_found:
+            investigation.summary = (
+                f"Errors found across {', '.join(investigation.services_searched)} "
+                f"({total_lines} total log lines)."
+            )
+        elif total_lines > 0:
             investigation.summary = (
                 f"Found {total_lines} log lines across {', '.join(investigation.services_searched)} "
                 f"but no clear error patterns matched."
@@ -461,7 +501,7 @@ class CloudWatchSearcher:
         else:
             investigation.summary = (
                 f"No relevant logs found in {', '.join(investigation.services_searched)} "
-                f"for the provided IDs in the last {hours_back} hours."
+                f"for the provided IDs (searched up to {SEARCH_WINDOWS[-1]}h / {SEARCH_WINDOWS[-1]//24}d)."
             )
         return investigation
 

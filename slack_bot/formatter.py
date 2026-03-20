@@ -26,6 +26,7 @@ def format_full_response(
     analysis: dict | None = None,
     poster_user_id: str = "",
     services_searched: list[str] | None = None,
+    data_sources: list[str] | None = None,
 ) -> str:
     """Format a single combined Slack response with point-to-point analysis.
 
@@ -35,6 +36,7 @@ def format_full_response(
         analysis: Parsed analysis dict with root_cause, cx_advice
         poster_user_id: Slack user ID of the person who posted the query
         services_searched: List of CloudWatch services that were searched
+        data_sources: List of data sources used (e.g. ["CloudWatch", "Databricks"])
     """
     display_name = CATEGORY_DISPLAY_NAMES.get(
         classification.category, classification.category
@@ -65,9 +67,14 @@ def format_full_response(
     # ─── Footer: assignment + services ─────────────────────────────────
     parts.append(f"\n———\n*Assigned to:* {tag}")
 
+    # Show data sources and services
+    meta_parts = []
+    if data_sources:
+        meta_parts.append(f"Data: {', '.join(data_sources)}")
     if services_searched:
-        services = ", ".join(services_searched)
-        parts.append(f"  |  _Services searched: {services}_")
+        meta_parts.append(f"Services: {', '.join(services_searched)}")
+    if meta_parts:
+        parts.append(f"  |  _{' | '.join(meta_parts)}_")
 
     parts.append(f"\n_{tag}, please pick this up._")
 

@@ -16,20 +16,21 @@ CLASSIFIER_SYSTEM_PROMPT = """You are a message classifier for Aspora's #cx-tech
 
 ## Categories
 
-1. **payment_error_diagnosis** — Debit/credit card transaction failures, payment attempt errors, 3DS issues, UPI failures, acquirer rejections, payment timeouts, wallet failures.
-   Signals: "payment failed", "transaction declined", "3DS", "card not working", "PA-" IDs, "EXCEEDS_DAILY_LIMIT", bank names + failure, "debit card", "credit card"
+1. **payment_error_diagnosis** — ANY issue where the customer tried to make a payment/transaction/transfer and it FAILED, got stuck, was declined, timed out, or didn't go through. This includes: card failures, UPI failures, 3DS issues, payment timeouts, acquirer rejections, "unable to complete transaction", "money deducted but transfer failed", "transaction not going through", payment attempt errors.
+   Signals: "payment failed", "transaction declined", "3DS", "card not working", "PA-" IDs, "EXCEEDS_DAILY_LIMIT", "unable to transact", "transaction failed", "transaction not going through", "payment error", "payment stuck", "payment not working", "could not complete", "debit failed", "money deducted but failed", bank names + failure, "debit card", "credit card", "UPI"
 
-2. **kyc_verification** — KYC pending/stuck/rejected, document verification failures, compliance service errors, identity verification, PEP/sanctions screening.
-   Signals: "KYC", "verification", "document rejected", "compliance", "identity", "Onfido", "PEP", "sanctions"
+2. **kyc_verification** — KYC pending/stuck/rejected, document verification failures, compliance service errors, identity verification, PEP/sanctions screening, "unable to complete KYC".
+   Signals: "KYC", "verification", "document rejected", "compliance", "identity", "Onfido", "Persona", "Sumsub", "PEP", "sanctions", "verification stuck"
 
-3. **db_lookup_status** — Order status lookups, transfer status discrepancies (AlphaDesk vs Falcon), refund status checks, CNR (Credit Not Received), fulfillment status.
-   Signals: "status of order", "where is my transfer", "refund", "AlphaDesk", "Falcon status", "CNR", "not syncing", "money deducted but"
+3. **db_lookup_status** — ONLY when the CX agent is asking to CHECK or LOOK UP a status, NOT when the customer has an actual failure. This is for status discrepancies between systems (AlphaDesk vs Falcon), refund tracking, CNR (Credit Not Received where money WAS sent but partner hasn't confirmed), fulfillment tracking.
+   Signals: "status of order", "check status", "what is the status", "refund status", "AlphaDesk shows X but Falcon shows Y", "CNR", "not syncing between systems", "fulfillment status", "order stuck in processing"
+   NOT this category: "payment failed", "unable to transact", "transaction error" → those go to payment_error_diagnosis
 
 4. **referral_promo** — Referral rewards not credited, promo code not working, cashback missing, campaign/offer issues.
    Signals: "referral", "promo code", "cashback", "reward not credited", "offer", "campaign", "first transaction bonus"
 
-5. **bbps_partner_escalation** — BBPS bill payment failures, partner issues (Checkout.com, LULU, banking partners), webhook failures, corridor-level outages.
-   Signals: "BBPS", "bill payment", "Checkout.com", "LULU", "partner", "webhook", "corridor down", "all customers affected"
+5. **bbps_partner_escalation** — BBPS bill payment failures, partner-side issues (Checkout.com, LULU, banking partners), webhook failures from partners, corridor-level outages affecting multiple customers.
+   Signals: "BBPS", "bill payment", "Checkout.com", "LULU partner", "partner down", "webhook failure", "corridor down", "all customers affected", "partner payout failed"
 
 6. **manual_backend_action** — State change requests, mobile number updates, manual DB corrections, account unlocks — anything requiring production database write access.
    Signals: "change state", "update mobile", "mobile number change", "unlock account", "DB update", "CURL", "manual fix needed"
@@ -43,17 +44,26 @@ CLASSIFIER_SYSTEM_PROMPT = """You are a message classifier for Aspora's #cx-tech
 9. **other_needs_triage** — Anything that doesn't clearly fit above. Ambiguous, multi-issue, new patterns, greetings, thanks, noise.
    Signals: very short messages, "thanks", "got it", no technical content, unclear what's being asked
 
-## Decision Rules
+## Decision Rules (apply in this order — first match wins)
 
-- If message mentions payment failure + specific order/card → **payment_error_diagnosis**
-- If message is about checking an order/transfer/refund status → **db_lookup_status**
-- If message says "KYC" or "verification" → **kyc_verification**
-- If message mentions a partner (Checkout, LULU, BBPS) + failure → **bbps_partner_escalation**
-- If message asks to change/update something in the DB → **manual_backend_action**
-- If message is about rates/FX/exchange → **rate_fx_investigation**
-- If message describes app misbehaviour or crashes → **app_bug_engineering**
-- If message is about referral/promo/cashback → **referral_promo**
-- When genuinely uncertain → **other_needs_triage**
+1. If message says "KYC" or "verification" or "document" → **kyc_verification**
+2. If message mentions ANY transaction/payment failure, decline, error, "unable to transact/transfer", "money deducted but failed", card/UPI issue → **payment_error_diagnosis**
+3. If message mentions a partner name (Checkout.com, LULU, BBPS) + failure/issue → **bbps_partner_escalation**
+4. If message asks to change/update/unlock something in the DB → **manual_backend_action**
+5. If message is about rates/FX/exchange → **rate_fx_investigation**
+6. If message describes app misbehaviour or crashes → **app_bug_engineering**
+7. If message is about referral/promo/cashback → **referral_promo**
+8. If message is ONLY about checking/looking up a status, refund tracking, or system sync issues (NOT a failure) → **db_lookup_status**
+9. When genuinely uncertain → **other_needs_triage**
+
+## IMPORTANT: payment_error_diagnosis vs db_lookup_status
+- "Customer unable to do transaction" → **payment_error_diagnosis** (it's a FAILURE)
+- "Money deducted but transfer not received" → **payment_error_diagnosis** (it's a FAILURE)
+- "Payment not going through" → **payment_error_diagnosis** (it's a FAILURE)
+- "Check the status of order AE123" → **db_lookup_status** (it's a STATUS CHECK)
+- "AlphaDesk shows completed but Falcon shows pending" → **db_lookup_status** (it's a SYNC issue)
+- "Refund not received" → **db_lookup_status** (it's TRACKING)
+- When in doubt between the two, prefer **payment_error_diagnosis**
 
 ## Identifier Formats
 
