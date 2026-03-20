@@ -82,12 +82,25 @@ class Poller:
             self._cleanup_completed()
             time.sleep(self.interval)
 
+    @staticmethod
+    def _normalize_ts(ts: str) -> str:
+        """Ensure timestamp has exactly 6 decimal digits (Slack format).
+
+        Slack timestamps are always '<epoch>.<6digits>'. If extra decimals
+        sneak in (e.g., from time.time()), the API silently returns 0 results.
+        """
+        if "." in ts:
+            integer, frac = ts.split(".", 1)
+            frac = (frac + "000000")[:6]  # pad or truncate to 6
+            return f"{integer}.{frac}"
+        return ts
+
     def _init_cursor(self):
         """Load cursor from file, or fetch latest message timestamp from Slack."""
         if os.path.exists(self.cursor_file):
             try:
                 with open(self.cursor_file, "r") as f:
-                    self.last_ts = f.read().strip()
+                    self.last_ts = self._normalize_ts(f.read().strip())
                 if self.last_ts:
                     logger.info(f"Loaded cursor from file: {self.last_ts}")
                     return
