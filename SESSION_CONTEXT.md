@@ -1,35 +1,45 @@
 # CX-Tech Bot — Session Context
 > Auto-updated before each session ends. Read this first when resuming.
 
-## Last Updated: 2026-03-19
+## Last Updated: 2026-03-21
 
 ## Project Overview
-Python Slack bot monitoring #cx-tech-queries. Classifies CX queries into 9 categories, investigates via CloudWatch logs + Databricks SQL (multi-agent architecture), and posts structured responses with Root Cause and CX Advice.
+Python Slack bot monitoring #cx-tech-queries. Classifies CX queries into 9 categories, investigates via CloudWatch logs + Databricks SQL, extracts structured case facts, selects approved playbook guidance from confirmed evidence, decides a response mode, and posts structured responses with Root Cause and CX Advice.
 
 ## Architecture
 ```
-Slack Message → Classifier (Claude Haiku) → Category
-                                          ↓
-                     ┌────────────────────┼────────────────────┐
-                     ↓                                         ↓
-              Agent 1: CloudWatch                    Agent 2: Databricks
-              (unstructured logs)                    (structured DB records)
-                     ↓                                         ↓
-                     └────────────────────┬────────────────────┘
-                                          ↓
-                              Parent Agent: Claude
-                              (synthesize → ROOT_CAUSE + CX_ADVICE)
-                                          ↓
-                              Slack Response + Assignment
+Slack Message → Classifier (Claude Haiku) → Category + IDs
+                                              ↓
+                         ┌────────────────────┼────────────────────┐
+                         ↓                                         ↓
+                  Agent 1: CloudWatch                    Agent 2: Databricks
+                  (unstructured logs)                    (structured DB records)
+                         ↓                                         ↓
+                         └────────────────────┬────────────────────┘
+                                              ↓
+                                  Structured Fact Extractor
+                                              ↓
+                             Evidence-backed Playbook Matcher
+                                              ↓
+                                   Response Mode Decision
+                           (auto_resolve / hybrid / escalate / triage)
+                                              ↓
+                                    Parent Agent: Claude
+                           (writes final ROOT_CAUSE + CX_ADVICE)
+                                              ↓
+                               Slack Response (+ assignment only if needed)
 ```
 
 ## Key Files
 | File | Purpose |
 |------|---------|
-| `handler.py` | Central routing: classify → investigate (parallel) → synthesize → post |
+| `handler.py` | Central routing: classify → investigate → facts → playbook → response mode → synthesize → post |
 | `cloudwatch/log_searcher.py` | Agent 1: CloudWatch log search with progressive windows (48h→7d→14d) |
 | `cloudwatch/log_analyzer.py` | Parent Agent: Claude prompts for synthesis + response parsing |
 | `db_agent/db_searcher.py` | Agent 2: Databricks SQL queries (READ-ONLY) |
+| `knowledge_base/case_facts.py` | Extracts normalized payment/KYC/status facts from investigation results |
+| `knowledge_base/cx_response_playbook.py` | Matches approved playbooks using confirmed facts only |
+| `knowledge_base/response_engine.py` | Decides response posture: auto-resolve, hybrid, escalate, triage |
 | `classifier/classifier.py` | Claude-based query classifier (9 categories) |
 | `classifier/fallback.py` | Keyword fallback when Claude classifier fails |
 | `slack_bot/poller.py` | Slack message polling |
@@ -82,7 +92,6 @@ Slack Message → Classifier (Claude Haiku) → Category
 - AWS CloudWatch: STS tokens in .env (expire frequently — user provides new ones)
 - Databricks: Personal access token in .env (90-day lifetime)
   - **Prod**: dbc-02d72862-314d.cloud.databricks.com, warehouse 557f5c781a55d9e5
-  - **Stage** (testing): dbc-2413ffb5-f638.cloud.databricks.com, warehouse 7b559589f8652677
 - Anthropic: API key in .env
 - Slack: Bot token in .env, channel C0AKF9U2RCL
 
@@ -91,7 +100,8 @@ Slack Message → Classifier (Claude Haiku) → Category
 2. **Bot must never crash** — All errors caught and escalated gracefully.
 3. **Both agents run in parallel** — ThreadPoolExecutor with 2 workers.
 4. **Progressive search windows** — 48h → 7d → 14d for both KYC and payment CW queries.
-5. **Response consistency** — Must always follow [ROOT_CAUSE] + [CX_ADVICE] format. No filler, no generic advice.
+5. **Evidence-backed guidance only** — playbook matching must come from DB/log facts, never Slack wording alone.
+6. **Response consistency** — Must always follow [ROOT_CAUSE] + [CX_ADVICE] format. No filler, no generic advice.
 
 ## Known Issues / TODOs
 - [ ] AWS STS tokens expire frequently — no auto-refresh
@@ -99,14 +109,25 @@ Slack Message → Classifier (Claude Haiku) → Category
 - [ ] referral_promo category has no investigation
 - [ ] manual_backend_action has no investigation
 - [ ] app_bug_engineering has no investigation
-- [ ] Dashboard needs API server (Flask) to serve data from metrics DB
-- [ ] Bot response inconsistency — Claude sometimes ignores format rules
+- [ ] Escalation routing still uses generic round-robin rather than contact-specific routing
+- [ ] Dashboard does not yet show response mode / playbook hit-rate / false-match review views
+- [ ] No feedback capture loop from Slack reactions or manual corrections yet
 
-## Git
-- Repo: https://github.com/kanishkkhandelwal-aspora/cx-techbot
-- Commit signing: ED25519-SK hardware key (must be plugged in)
-
-## Engineers (Round Robin)
+## Contacts
+### Engineers (Round Robin)
 - Vatsal Gajjar
 - Adarsh
 - Kanishk
+
+### Escalation Contacts Referenced in Playbooks / Docs
+- Ayush — Falcon/GOMS sync, webhook resend
+- Raj — Falcon/GOMS sync, webhook resend
+- Shyam Tayal — CNR / await / refund-style ops follow-up
+
+Slack IDs for Ayush, Raj, and Shyam Tayal are not stored in repo.
+
+## Git
+- Repo: https://github.com/kanishkkhandelwal-aspora/cx-techbot
+- Branch: `codex/evidence-backed-responses`
+- Commit: `1552b20` (`Add evidence-backed response pipeline`)
+- Commit signing uses local hardware key; unsigned local override was needed for this branch commit

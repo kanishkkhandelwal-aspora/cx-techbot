@@ -1,15 +1,15 @@
 # CX-Tech Bot — Project Context
 
-> **Last updated:** 2026-03-18
+> **Last updated:** 2026-03-21
 > Update this file every time code changes are made.
 
 ---
 
 ## What This Is
 
-A Python Slack bot that automatically classifies CX (Customer Experience) queries, investigates them via CloudWatch logs + Databricks SQL, synthesizes root causes using Claude AI, and assigns them to engineers in round-robin fashion.
+A Python Slack bot that automatically classifies CX (Customer Experience) queries, investigates them via CloudWatch logs + Databricks SQL, extracts structured case facts from that evidence, selects approved playbook guidance from confirmed facts, synthesizes root causes using Claude AI, and assigns only the cases that actually need human follow-up.
 
-**Multi-agent architecture:** Agent 1 (CloudWatch logs) + Agent 2 (Databricks SQL) → Parent Agent (Claude synthesizer)
+**Multi-agent architecture:** Agent 1 (CloudWatch logs) + Agent 2 (Databricks SQL) → Structured Fact Extractor → Evidence-backed Playbook → Response Mode Gate → Parent Agent (Claude synthesizer)
 
 **Slack channel:** `#testing-openclawbot` (C0AKF9U2RCL)
 **Runtime:** Python 3.14, runs as a polling loop (not websocket/events API)
@@ -34,10 +34,19 @@ Handler.handle()
         │  Agent 2: Databricks SQL queries (structured)        │
         └──────────────────────────────────────────────────────┘
             ↓
-        Parent Agent: Claude Synthesizer
-            (merges DB records + log lines → [ROOT_CAUSE] / [CX_ADVICE])
+        Structured Fact Extractor
+            (normalizes payment reason, statuses, provider, rejection, sync issue)
             ↓
-        Round-robin Assignment → one of 3 engineers
+        Evidence-backed Playbook Matcher
+            (matches only from confirmed facts, never Slack wording alone)
+            ↓
+        Response Mode Gate
+            (auto_resolve / hybrid / escalate / triage)
+            ↓
+        Parent Agent: Claude Synthesizer
+            (writes final [ROOT_CAUSE] / [CX_ADVICE] using facts + mode)
+            ↓
+        Assignment only for escalate/triage cases
             ↓
         Formatter → single Slack thread reply with bullet points + data sources
 ```
@@ -68,6 +77,12 @@ Handler.handle()
 │   ├── __init__.py
 │   └── db_searcher.py       # Agent 2: Databricks SQL queries against prod.silver_schema.*
 │
+├── knowledge_base/
+│   ├── __init__.py
+│   ├── case_facts.py        # Extracts normalized case facts from DB/log investigation
+│   ├── cx_response_playbook.py  # Evidence-backed playbook matcher
+│   └── response_engine.py   # Chooses response mode: auto_resolve / hybrid / escalate / triage
+│
 ├── slack_bot/
 │   ├── poller.py            # Polls Slack for new messages + scans threads for @bot mentions
 │   └── formatter.py         # Formats Slack responses (full, triage, direct search)
@@ -87,6 +102,11 @@ Handler.handle()
 │   ├── app.py               # Flask web dashboard — real-time monitoring (port 5050)
 │   └── templates/
 │       └── dashboard.html   # Single-page dashboard with Chart.js charts
+│
+├── tests/
+│   ├── fixtures/
+│   │   └── evidence_cases.json   # Regression fixtures for evidence-backed response flow
+│   └── test_evidence_pipeline.py # Offline regression tests for facts + playbook + formatting
 │
 ├── CONTEXT.md               # ← This file
 ├── CX-Tech-Bot-Overview.md  # Original project overview doc
@@ -114,7 +134,7 @@ Handler.handle()
 - **Services:** goblin-service, app-server-service, goms-service, verification-service, workflow-service
 
 ### Parent Agent / Synthesizer (`cloudwatch/log_analyzer.py`)
-- **Role:** Merges inputs from Agent 1 (CloudWatch) + Agent 2 (Databricks) into unified analysis
+- **Role:** Writes final Root Cause / CX Advice after facts and response mode are already decided
 - Two prompts: `LOG_ANALYSIS_PROMPT` (general) and `KYC_ANALYSIS_PROMPT` (includes rejection_reasons.md KB)
 - Both prompts accept `{log_lines}` placeholder which now includes both "Structured Database Records (Databricks)" and "CloudWatch Log Lines" sections
 - DB records are marked as AUTHORITATIVE — Claude trusts exact field values over log parsing
@@ -135,12 +155,54 @@ Handler.handle()
 - Returns `DBInvestigationResult` with structured `summary_text` that gets fed to the Parent Agent
 - Connection via `databricks-sql-connector` library
 
+### Structured Fact Layer (`knowledge_base/case_facts.py`)
+- Builds `CaseFacts` from Databricks rows first, then CloudWatch evidence
+- Extracts normalized facts such as:
+  - `payment_failure_reason`
+  - `provider` / `acquirer`
+  - `order_status` / `order_sub_state`
+  - `fulfillment_status` / `fulfillment_sub_status`
+  - `payout_status` / `payout_error`
+  - `kyc_status`
+  - `rejection_reason` / `rejection_count`
+  - `sync_issue`, `retryable`, `manual_action_needed`
+- Converts known signals into a normalized set (`do_not_honour`, `provider_rejected`, `no_match`, `webhook_not_sent`, etc.)
+- Produces `evidence_strength` and prompt-ready structured fact text
+
+### Evidence-backed Playbook (`knowledge_base/cx_response_playbook.py`)
+- Matches only from `CaseFacts`
+- Never uses the original Slack message or Claude wording for playbook selection
+- Each rule contains:
+  - category
+  - required facts
+  - supporting facts
+  - excluded facts
+  - required/supporting/excluded signals
+  - guidance text
+  - `response_mode`
+- If multiple rules tie, returns no match instead of guessing
+
+### Response Engine (`knowledge_base/response_engine.py`)
+- Chooses one of:
+  - `auto_resolve`
+  - `hybrid`
+  - `escalate`
+  - `triage`
+- Uses classifier confidence + fact strength + playbook match + manual-action signals
+- Auto-resolved cases do not require assignment
+
 ### Handler (`handler.py`)
 - `handle()` → routes: `is_bot_mention` → `_handle_direct_search()`, else → `_handle_classify()`
 - **Multi-agent orchestration:** `_investigate_parallel()` runs Agent 1 + Agent 2 concurrently via `ThreadPoolExecutor`
-- Results from both agents are fed to `analyze_logs_with_claude()` (Parent Agent) which synthesizes them
-- For KYC, sends ALL log lines to Claude (not just error_lines) — JSON response bodies contain diagnosis data
-- When both sources return 0 results, generates a helpful fallback analysis
+- Results from both agents are converted into `CaseFacts`
+- Playbook is matched from facts, not message text
+- Response mode is decided before Claude synthesis
+- Claude receives:
+  - response mode
+  - structured facts
+  - approved playbook guidance if one matched
+- When synthesis is unavailable, handler generates a safe fallback from facts
+- Assignment happens only for `escalate` and `triage`
 - `_handle_direct_search()` → parses @bot command, extracts UUID + service name, runs targeted search (14-day window)
 - `_get_ids_from_parent()` → if no UUID in command, grabs it from the parent thread message
 
@@ -152,10 +214,12 @@ Handler.handle()
 - Cursor persistence to `.cxbot_cursor` file
 
 ### Formatter (`slack_bot/formatter.py`)
-- `format_full_response()` — main response: Root Cause + CX Advice + footer with assignment + services
+- `format_full_response()` — main response: Root Cause + CX Advice + footer with assignment or auto-resolved status
 - `format_triage_response()` — low-confidence fallback
 - `format_direct_search_response()` — for @bot direct search results
 - Tags the original poster (`<@user_id>`) in CX Advice section
+- Approved playbook guidance is appended as extra bullets under `CX Advice`
+- No separate "Playbook Guidance" section is shown to users
 
 ### Assigner (`assigner/assigner.py`)
 - Pure round-robin across 3 engineers
@@ -175,6 +239,17 @@ Handler.handle()
 - Reads from the same `cxbot_metrics.db` as the bot (read-only, separate connection)
 - Run with: `python dashboard/app.py`
 
+### Tests (`tests/test_evidence_pipeline.py`)
+- Offline regression pack for evidence-backed response flow
+- Covers:
+  - TrueLayer cancel flow
+  - GOMS `CREATED` stuck
+  - Falcon/GOMS sync
+  - `NO_MATCH`
+  - `DOCUMENTS_EXPIRED`
+  - unknown cases that must not match a playbook
+- Also verifies formatter keeps playbook bullets under `CX Advice`
+
 ---
 
 ## @Bot Direct Search Feature
@@ -191,7 +266,7 @@ Users can tag the bot in any thread to do a targeted CloudWatch search:
 
 - Service aliases defined in `SERVICE_ALIASES` dict in `log_searcher.py`
 - Uses 14-day search window
-- Claude analyzes results with appropriate prompt (KYC vs general)
+- Direct search also builds facts from the found logs before attaching playbook guidance
 - Posts Root Cause + CX Advice in the thread
 
 ---
@@ -201,8 +276,9 @@ Users can tag the bot in any thread to do a targeted CloudWatch search:
 Single Slack thread reply with:
 1. **Root Cause** — bullet points with specific errors/codes/statuses
 2. **CX Advice** — actionable bullet points for CX agent (tags the poster)
-3. **Footer** — assigned engineer + services searched
+3. **Footer** — either assigned engineer + services searched, or auto-resolved status
 
+Approved playbook guidance, if present, is appended under **CX Advice** as extra bullets.
 No product bug section (removed). Point-to-point bullet style, not paragraphs.
 
 ---
@@ -248,13 +324,20 @@ Covers:
 ANTHROPIC_API_KEY=
 SLACK_BOT_TOKEN=
 SLACK_CHANNEL_ID=C0AKF9U2RCL
+CXBOT_ENV=stage
+CXBOT_POLL_INTERVAL=15
+CXBOT_CURSOR_FILE=.cxbot_cursor
+CXBOT_DB_PATH=cxbot_metrics.db
+CLASSIFIER_MODEL=claude-haiku-4-5-20251001
 AWS_ACCESS_KEY_ID=        # STS temporary credentials
 AWS_SECRET_ACCESS_KEY=
 AWS_SESSION_TOKEN=
 AWS_REGION=eu-west-2
-DATABRICKS_SERVER_HOSTNAME=   # e.g. adb-1234567890.1.azuredatabricks.net
-DATABRICKS_HTTP_PATH=         # e.g. /sql/1.0/warehouses/abcdef123456
-DATABRICKS_ACCESS_TOKEN=      # Personal access token
+CW_GOBLIN_LOG_GROUP=/ecs/vance-core/prod/london/01/goblin-service-logs
+DATABRICKS_SERVER_HOSTNAME=
+DATABRICKS_HTTP_PATH=
+DATABRICKS_ACCESS_TOKEN=
+DASHBOARD_PORT=5050
 ```
 
 ---
@@ -281,6 +364,8 @@ pkill -f "main.py"; sleep 1 && rm -f .cxbot_cursor cxbot_assigner_state.json && 
 ## GitHub
 
 **Repo:** https://github.com/kanishkkhandelwal-aspora/cx-techbot
+**Branch:** `codex/evidence-backed-responses`
+**Commit:** `1552b20` — `Add evidence-backed response pipeline`
 
 ---
 
@@ -306,6 +391,22 @@ pkill -f "main.py"; sleep 1 && rm -f .cxbot_cursor cxbot_assigner_state.json && 
 - **Claude API Timeout**: Added 30s hard timeout to prevent hanging on synthesis calls
 - **Thread-safe SQLite**: `check_same_thread=False` for MetricsDB connection
 - Added `flask>=3.0.0` to requirements.txt
+
+### 2026-03-21 (Evidence-backed Responses)
+- Added `knowledge_base/case_facts.py` to extract normalized evidence-backed facts from Databricks + CloudWatch
+- Added `knowledge_base/cx_response_playbook.py` to match approved responses only from confirmed facts
+- Added `knowledge_base/response_engine.py` to choose response mode: `auto_resolve`, `hybrid`, `escalate`, `triage`
+- Reworked handler flow to:
+  - investigate first
+  - extract facts
+  - choose playbook from facts
+  - decide response mode
+  - call Claude only after those are fixed
+- Removed Slack-message-driven playbook matching
+- Auto-resolved cases no longer require engineer assignment
+- Updated formatter so approved playbook guidance is appended under `CX Advice`
+- Added offline regression coverage in `tests/test_evidence_pipeline.py`
+- Added fixture pack in `tests/fixtures/evidence_cases.json`
 
 ### 2026-03-18
 - **Multi-agent architecture**: Bot now runs two investigation agents in parallel:
