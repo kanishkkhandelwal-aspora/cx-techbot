@@ -1,0 +1,122 @@
+[
+  {
+    "name": "truelayer_cancel_flow",
+    "category": "payment_error_diagnosis",
+    "db_rows": [
+      {
+        "table": "goms_db_payment_attempts",
+        "rows": [
+          {
+            "status": "failed",
+            "reason": "canceled",
+            "meta_response_summary": "TrueLayer user canceled at provider during authentication flow"
+          }
+        ]
+      }
+    ],
+    "expected_playbook": "Bank authorization not completed",
+    "expected_mode": "auto_resolve"
+  },
+  {
+    "name": "goms_created_stuck",
+    "category": "db_lookup_status",
+    "db_rows": [
+      {
+        "table": "goms_db_orders",
+        "rows": [
+          {
+            "status": "CREATED",
+            "sub_state": ""
+          }
+        ]
+      }
+    ],
+    "log_lines": [
+      "manual sync trigger required before move to ON_HOLD"
+    ],
+    "expected_playbook": "GOMS order stuck in CREATED",
+    "expected_mode": "escalate"
+  },
+  {
+    "name": "falcon_goms_sync",
+    "category": "db_lookup_status",
+    "db_rows": [
+      {
+        "table": "goms_db_orders",
+        "rows": [
+          {
+            "status": "PROCESSING"
+          }
+        ]
+      },
+      {
+        "table": "falcondb_falcon_transactions_v2",
+        "rows": [
+          {
+            "status": "COMPLETED"
+          }
+        ]
+      }
+    ],
+    "log_lines": [
+      "Webhook not sent due to Kafka timeout in events flow"
+    ],
+    "expected_playbook": "Falcon and GOMS sync failure",
+    "expected_mode": "escalate"
+  },
+  {
+    "name": "kyc_no_match",
+    "category": "kyc_verification",
+    "db_rows": [
+      {
+        "table": "appserver_db_user_kyc",
+        "rows": [
+          {
+            "kyc_status": "REJECTED",
+            "provider": "LULU",
+            "rejection_reason": "NO_MATCH",
+            "rejection_count": 1
+          }
+        ]
+      }
+    ],
+    "expected_playbook": "NO_MATCH on Lulu face verification",
+    "expected_mode": "hybrid"
+  },
+  {
+    "name": "kyc_documents_expired",
+    "category": "kyc_verification",
+    "db_rows": [
+      {
+        "table": "appserver_db_user_kyc",
+        "rows": [
+          {
+            "kyc_status": "REJECTED",
+            "provider": "PERSONA",
+            "rejection_reason": "DOCUMENTS_EXPIRED",
+            "rejection_count": 1
+          }
+        ]
+      }
+    ],
+    "expected_playbook": "Documents expired",
+    "expected_mode": "auto_resolve"
+  },
+  {
+    "name": "unknown_should_not_match",
+    "category": "payment_error_diagnosis",
+    "db_rows": [
+      {
+        "table": "goms_db_payment_attempts",
+        "rows": [
+          {
+            "status": "failed",
+            "reason": "mystery_error_123"
+          }
+        ]
+      }
+    ],
+    "expected_playbook": null,
+    "expected_mode": "triage"
+  }
+]

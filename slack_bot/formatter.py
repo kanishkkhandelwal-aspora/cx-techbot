@@ -22,7 +22,7 @@ CATEGORY_DISPLAY_NAMES = {
 
 def format_full_response(
     classification: "CXClassification",
-    assignment: "Assignment",
+    assignment: "Assignment | None",
     analysis: dict | None = None,
     poster_user_id: str = "",
     services_searched: list[str] | None = None,
@@ -32,7 +32,7 @@ def format_full_response(
 
     Args:
         classification: The classified query result
-        assignment: The assigned engineer
+        assignment: The assigned engineer when human follow-up is needed
         analysis: Parsed analysis dict with root_cause, cx_advice
         poster_user_id: Slack user ID of the person who posted the query
         services_searched: List of CloudWatch services that were searched
@@ -41,7 +41,7 @@ def format_full_response(
     display_name = CATEGORY_DISPLAY_NAMES.get(
         classification.category, classification.category
     )
-    tag = assignment.slack_tag
+    tag = assignment.slack_tag if assignment else ""
     poster_tag = f"<@{poster_user_id}>" if poster_user_id else ""
 
     parts = [f":mag: *CX-Tech Bot — {display_name}*\n"]
@@ -55,6 +55,9 @@ def format_full_response(
 
         # 2. CX Advice (tag the original poster)
         cx_advice = analysis.get("cx_advice", "")
+        playbook_guidance = analysis.get("playbook_guidance", "")
+        if playbook_guidance:
+            cx_advice = f"{cx_advice}\n{playbook_guidance}".strip() if cx_advice else playbook_guidance
         if cx_advice:
             parts.append(f"\n*2. CX Advice* {poster_tag}\n{cx_advice}\n")
 
@@ -64,8 +67,17 @@ def format_full_response(
         if poster_tag:
             parts.append(f"\n{poster_tag}\n")
 
+        playbook_guidance = analysis.get("playbook_guidance", "") if analysis else ""
+        if playbook_guidance:
+            parts.append(f"\n*CX Advice* {poster_tag}\n{playbook_guidance}\n")
+
     # ─── Footer: assignment + services ─────────────────────────────────
-    parts.append(f"\n———\n*Assigned to:* {tag}")
+    parts.append("\n———")
+
+    if assignment:
+        parts.append(f"\n*Assigned to:* {tag}")
+    else:
+        parts.append("\n*Status:* Auto-resolved by bot")
 
     # Show data sources and services
     meta_parts = []
@@ -76,7 +88,8 @@ def format_full_response(
     if meta_parts:
         parts.append(f"  |  _{' | '.join(meta_parts)}_")
 
-    parts.append(f"\n_{tag}, please pick this up._")
+    if assignment:
+        parts.append(f"\n_{tag}, please pick this up._")
 
     return "".join(parts)
 
@@ -125,6 +138,9 @@ def format_direct_search_response(
             parts.append(f"\n*1. Root Cause*\n{root_cause}\n")
 
         cx_advice = analysis.get("cx_advice", "")
+        playbook_guidance = analysis.get("playbook_guidance", "")
+        if playbook_guidance:
+            cx_advice = f"{cx_advice}\n{playbook_guidance}".strip() if cx_advice else playbook_guidance
         if cx_advice:
             parts.append(f"\n*2. CX Advice* {poster_tag}\n{cx_advice}\n")
     else:

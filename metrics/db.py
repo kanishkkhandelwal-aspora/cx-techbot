@@ -68,7 +68,8 @@ class MetricsDB:
                 pass  # column already exists
         self.conn.commit()
 
-    def record(self, msg, classification, assignment,
+    def record(self, msg, classification, assignment=None,
+               assigned_to: str = "AUTO_RESOLVED",
                response_time_ms: int = 0,
                data_sources: list[str] = None,
                error_found: bool = False,
@@ -94,7 +95,7 @@ class MetricsDB:
                     classification.category,
                     classification.confidence,
                     classification.summary,
-                    assignment.engineer,
+                    assignment.engineer if assignment else assigned_to,
                     json.dumps(classification.order_ids),
                     json.dumps(classification.user_ids),
                     classification.corridor,

@@ -22,9 +22,13 @@ from slack_bot.formatter import (
 from metrics.db import MetricsDB
 from cloudwatch.log_searcher import (
     CloudWatchSearcher, INVESTIGATE_CATEGORIES, SERVICE_ALIASES, SERVICE_DISPLAY_NAMES,
+    InvestigationResult,
 )
 from cloudwatch.log_analyzer import analyze_logs_with_claude, parse_structured_analysis
 from db_agent.db_searcher import DatabricksSearcher, INVESTIGATE_CATEGORIES as DB_INVESTIGATE_CATEGORIES
+from knowledge_base.case_facts import build_case_facts, CaseFacts
+from knowledge_base.cx_response_playbook import find_playbook_match
+from knowledge_base.response_engine import decide_response_mode
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +58,62 @@ class Handler:
             return self._handle_direct_search(msg)
         return self._handle_classify(msg)
 
+    @staticmethod
+    def _attach_playbook_guidance(analysis: dict | None, guidance: str) -> dict:
+        """Append approved playbook guidance under CX advice."""
+        result = dict(analysis or {})
+        bullet = f"• {guidance}"
+        existing = result.get("playbook_guidance", "")
+        if existing:
+            if guidance.lower() not in existing.lower():
+                result["playbook_guidance"] = f"{existing}\n{bullet}"
+        else:
+            result["playbook_guidance"] = bullet
+        return result
+
+    @staticmethod
+    def _fallback_analysis_for_facts(result: CXClassification, facts: CaseFacts) -> dict:
+        """Build a safe fallback when Claude synthesis is unavailable."""
+        if facts.category == "kyc_verification":
+            root = "• No confirmed KYC failure reason was synthesized from the available evidence."
+            if facts.kyc_status:
+                root = f"• KYC status is `{facts.kyc_status}`."
+                if facts.rejection_reason:
+                    root += f"\n• Rejection reason is `{facts.rejection_reason}`."
+            advice = "• Review the verified KYC status and ask the customer to retry only if the issue is clearly retryable."
+            return {"root_cause": root, "cx_advice": advice}
+
+        if facts.payment_failure_reason:
+            root = f"• Confirmed payment failure reason: `{facts.payment_failure_reason}`."
+            if facts.provider:
+                root += f"\n• Provider/acquirer signal: `{facts.provider}`."
+            advice = "• Use the confirmed payment reason and provider details below for the customer response."
+            return {"root_cause": root, "cx_advice": advice}
+
+        if facts.order_status or facts.fulfillment_status or facts.payout_status:
+            parts = []
+            if facts.order_status:
+                parts.append(f"order status=`{facts.order_status}`")
+            if facts.order_sub_state:
+                parts.append(f"sub-state=`{facts.order_sub_state}`")
+            if facts.fulfillment_status:
+                parts.append(f"fulfillment=`{facts.fulfillment_status}`")
+            if facts.payout_status:
+                parts.append(f"payout=`{facts.payout_status}`")
+            root = f"• Confirmed status data: {', '.join(parts)}."
+            advice = "• Respond using the confirmed system state below."
+            return {"root_cause": root, "cx_advice": advice}
+
+        ids_str = ""
+        if result.user_ids:
+            ids_str = f"user_id: {result.user_ids[0]}"
+        elif result.order_ids:
+            ids_str = f"order_id: {result.order_ids[0]}"
+        return {
+            "root_cause": f"• No definitive backend evidence was found for {ids_str or 'the provided identifiers'}.",
+            "cx_advice": "• Confirm the customer's identifiers and retry only if the customer completed the flow in the app.",
+        }
+
     def _handle_classify(self, msg: SlackMessage):
         """Classify -> Investigate -> Analyze -> Assign -> Post single response -> Record."""
         try:
@@ -62,16 +122,7 @@ class Handler:
             # 1. Classify
             result = self.classifier.classify(msg.text)
 
-            # 2. Check if triage needed
-            is_triage = (
-                result.category == "other_needs_triage"
-                or result.confidence < 0.5
-            )
-
-            # 3. Assign
-            assignment = self.assigner.assign(result.category, msg.timestamp)
-
-            # 4. Multi-agent investigation: CloudWatch + Databricks in parallel
+            # 2. Multi-agent investigation: CloudWatch + Databricks in parallel
             #    Agent 1: CloudWatch logs (unstructured)
             #    Agent 2: Databricks SQL (structured)
             #    Parent: Claude synthesizer
@@ -80,10 +131,12 @@ class Handler:
             db_investigation = None
             services_searched = []
             data_sources = []  # Track which sources provided data
+            db_summary = ""
+            all_log_lines: list[str] = []
             cw_enabled = result.category in INVESTIGATE_CATEGORIES
             db_enabled = result.category in DB_INVESTIGATE_CATEGORIES
 
-            if not is_triage and (
+            if result.category != "other_needs_triage" and result.confidence >= 0.5 and (
                 (self.cw_searcher and cw_enabled) or (self.db_searcher and db_enabled)
             ):
                 investigation, db_investigation = self._investigate_parallel(
@@ -100,10 +153,6 @@ class Handler:
                 if db_investigation and db_investigation.has_data:
                     data_sources.append("Databricks")
 
-                # Get log lines + DB summary for Claude synthesis
-                all_log_lines = []
-                db_summary = ""
-
                 if investigation:
                     for step in investigation.search_steps:
                         all_log_lines.extend(step.all_lines)
@@ -111,65 +160,56 @@ class Handler:
                 if db_investigation and db_investigation.has_data:
                     db_summary = db_investigation.summary_text
 
-                # Run Claude synthesis (Parent Agent)
-                if (all_log_lines or db_summary) and self.anthropic_client:
-                    context = (
-                        f"Category: {result.category}\n"
-                        f"Original CX query: {msg.text[:300]}\n"
-                        f"Data sources: {', '.join(data_sources) if data_sources else 'none'}"
-                    )
-                    if investigation:
-                        context += f"\nServices searched: {', '.join(investigation.services_searched)}"
+            facts = build_case_facts(
+                category=result.category,
+                db_investigation=db_investigation,
+                cw_investigation=investigation,
+            )
+            playbook_match = find_playbook_match(facts) if facts.evidence_strength > 0 else None
+            response_mode = decide_response_mode(
+                category=result.category,
+                classifier_confidence=result.confidence,
+                facts=facts,
+                playbook_match=playbook_match,
+            )
+            is_triage = response_mode == "triage"
 
-                    analyzed = analyze_logs_with_claude(
-                        client=self.anthropic_client,
-                        log_lines=all_log_lines,
-                        model=self.classifier_model,
-                        context=context,
-                        category=result.category,
-                        db_summary=db_summary,
-                    )
-                    if analyzed:
-                        analysis = parse_structured_analysis(analyzed)
-                        logger.info(f"Claude synthesis: {analyzed[:150]}...")
+            # 3. Run Claude only after facts + playbook + response mode are fixed
+            if (all_log_lines or db_summary) and self.anthropic_client:
+                context = (
+                    f"Category: {result.category}\n"
+                    f"Response mode: {response_mode}\n"
+                    f"Original CX query: {msg.text[:300]}\n"
+                    f"Data sources: {', '.join(data_sources) if data_sources else 'none'}\n"
+                    f"Structured facts:\n{facts.to_prompt_text()}"
+                )
+                if playbook_match:
+                    context += f"\nApproved playbook guidance:\n- {playbook_match.guidance}"
+                if investigation:
+                    context += f"\nServices searched: {', '.join(investigation.services_searched)}"
 
-                # Fallback when no data from either source
-                if not analysis:
-                    has_cw_lines = investigation and sum(
-                        s.total_results for s in investigation.search_steps
-                    ) > 0
-                    has_db_data = db_investigation and db_investigation.has_data
+                analyzed = analyze_logs_with_claude(
+                    client=self.anthropic_client,
+                    log_lines=all_log_lines,
+                    model=self.classifier_model,
+                    context=context,
+                    category=result.category,
+                    db_summary=db_summary,
+                )
+                if analyzed:
+                    analysis = parse_structured_analysis(analyzed)
+                    logger.info(f"Claude synthesis: {analyzed[:150]}...")
 
-                    if not has_cw_lines and not has_db_data:
-                        # Extract IDs from classification for the fallback
-                        ids_str = ""
-                        if result.user_ids:
-                            ids_str = f"user_id: {result.user_ids[0]}"
-                        elif result.order_ids:
-                            ids_str = f"order_id: {result.order_ids[0]}"
+            if not analysis:
+                analysis = self._fallback_analysis_for_facts(result, facts)
 
-                        if result.category == "kyc_verification":
-                            analysis = {
-                                "root_cause": (
-                                    f"• No KYC record found for {ids_str or 'provided ID'} in database (searched up to 14 days).\n"
-                                    f"• User likely hasn't initiated the KYC flow yet."
-                                ),
-                                "cx_advice": (
-                                    "• Confirm with customer if they started the KYC process in the app.\n"
-                                    "• If yes, ask them to close and reopen the app, then retry KYC from scratch."
-                                ),
-                            }
-                        else:
-                            analysis = {
-                                "root_cause": (
-                                    f"• No transaction record found for {ids_str or 'provided ID'} in database (searched up to 14 days).\n"
-                                    f"• Payment likely didn't reach the backend — user may not have completed checkout."
-                                ),
-                                "cx_advice": (
-                                    "• Confirm with customer if the payment screen loaded and they entered card details.\n"
-                                    "• If amount was debited from bank, it will auto-reverse within 48h."
-                                ),
-                            }
+            if playbook_match and response_mode in {"auto_resolve", "hybrid", "escalate"}:
+                analysis = self._attach_playbook_guidance(analysis, playbook_match.guidance)
+
+            # 4. Assign only if a human follow-up path is needed
+            assignment = None
+            if response_mode in {"escalate", "triage"}:
+                assignment = self.assigner.assign(result.category, msg.timestamp)
 
             # 5. Format & post single combined response
             if is_triage:
@@ -203,6 +243,7 @@ class Handler:
 
             self.metrics.record(
                 msg, result, assignment,
+                assigned_to=response_mode.upper(),
                 response_time_ms=elapsed_ms,
                 data_sources=data_sources,
                 error_found=bool(investigation and investigation.error_found),
@@ -218,8 +259,13 @@ class Handler:
             self.poller.mark_done(msg.timestamp)
 
             logger.info(
-                "Handled message ts=%s category=%s assigned_to=%s confidence=%.2f elapsed=%dms",
-                msg.timestamp, result.category, assignment.engineer, result.confidence, elapsed_ms,
+                "Handled message ts=%s category=%s mode=%s assigned_to=%s confidence=%.2f elapsed=%dms",
+                msg.timestamp,
+                result.category,
+                response_mode,
+                assignment.engineer if assignment else response_mode.upper(),
+                result.confidence,
+                elapsed_ms,
             )
 
         except Exception as e:
@@ -309,21 +355,36 @@ class Handler:
                 limit=200,
             )
 
+            category = "kyc_verification" if "verification" in service_display or "workflow" in service_display else "payment_error_diagnosis"
+
             # Analyze with Claude if we got results
             analysis = None
             if result.all_lines and self.anthropic_client:
+                facts = build_case_facts(
+                    category=category,
+                    cw_investigation=InvestigationResult(
+                        category=category,
+                        search_steps=[result],
+                        services_searched=[service_display],
+                    ),
+                )
+                playbook_match = find_playbook_match(facts) if facts.evidence_strength > 0 else None
                 context = (
                     f"Direct search by CX agent.\n"
+                    f"Response mode: hybrid\n"
                     f"Search ID: {search_id}\n"
                     f"Service: {service_display}\n"
-                    f"Original request: {clean_text[:300]}"
+                    f"Original request: {clean_text[:300]}\n"
+                    f"Structured facts:\n{facts.to_prompt_text()}"
                 )
+                if playbook_match:
+                    context += f"\nApproved playbook guidance:\n- {playbook_match.guidance}"
                 raw_analysis = analyze_logs_with_claude(
                     client=self.anthropic_client,
                     log_lines=result.all_lines,
                     model=self.classifier_model,
                     context=context,
-                    category="kyc_verification" if "verification" in service_display or "workflow" in service_display else "",
+                    category=category,
                 )
                 if raw_analysis:
                     analysis = parse_structured_analysis(raw_analysis)
@@ -340,6 +401,18 @@ class Handler:
                         "root_cause": f"• Found {result.total_results} log lines in {service_display} but no clear errors detected.",
                         "cx_advice": "• The logs are available but no obvious failure pattern was found.\n• Escalate to the assigned engineer for deeper investigation.",
                     }
+
+            facts = build_case_facts(
+                category=category,
+                cw_investigation=InvestigationResult(
+                    category=category,
+                    search_steps=[result],
+                    services_searched=[service_display],
+                ),
+            )
+            playbook_match = find_playbook_match(facts) if facts.evidence_strength > 0 else None
+            if playbook_match:
+                analysis = self._attach_playbook_guidance(analysis, playbook_match.guidance)
 
             # Format and post
             response = format_direct_search_response(
