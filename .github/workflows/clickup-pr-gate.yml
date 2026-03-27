@@ -1,0 +1,149 @@
+name: ClickUp PR Gate
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+permissions:
+  pull-requests: read
+  statuses: write
+
+jobs:
+  validate-clickup-task:
+    name: Validate ClickUp Task
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Extract and Validate ClickUp Task ID
+        uses: actions/github-script@v7
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          CLICKUP_SPACE_ID: "90166663966"
+        with:
+          script: |
+            const prBody = context.payload.pull_request.body || '';
+            const prTitle = context.payload.pull_request.title || '';
+            const prNumber = context.payload.pull_request.number;
+            const searchText = `${prTitle}\n${prBody}`;
+
+            console.log('=== ClickUp PR Gate ===');
+            console.log(`PR #${prNumber}: ${prTitle}`);
+            console.log(`PR Body:\n${prBody}\n`);
+
+            // -------------------------------------------------
+            // 1. Extract ClickUp Task ID from PR description
+            //    Supported formats:
+            //    - Full URL:  https://app.clickup.com/t/86d2ey8g0
+            //    - Prefixed:  CU-86d2ey8g0
+            //    - Raw ID:    ClickUp: 86d2ey8g0
+            // -------------------------------------------------
+            const patterns = [
+              // Full ClickUp URL — extract task ID from the end
+              /https?:\/\/app\.clickup\.com\/t\/([a-z0-9]+)/gi,
+              // CU- prefixed format (task IDs always start with a digit)
+              /CU-([0-9][a-z0-9]+)/gi,
+              // Explicit label patterns: "ClickUp: <id>" or "ClickUp-ID: <id>"
+              /(?:clickup|clickup[- ]?id)\s*[:=]\s*#?([0-9][a-z0-9]{5,})/gi,
+            ];
+
+            const taskIds = new Set();
+
+            for (const pattern of patterns) {
+              let match;
+              while ((match = pattern.exec(searchText)) !== null) {
+                taskIds.add(match[1].toLowerCase());
+              }
+            }
+
+            if (taskIds.size === 0) {
+              core.setFailed(
+                '❌ No ClickUp Task ID found in the PR description.\n\n' +
+                'Please include a ClickUp task reference in your PR description using one of these formats:\n' +
+                '  • https://app.clickup.com/t/<task_id>\n' +
+                '  • CU-<task_id>\n' +
+                '  • ClickUp: <task_id>\n\n' +
+                'This is required to link every PR to a tracked task.'
+              );
+              return;
+            }
+
+            console.log(`Found ClickUp Task ID(s): ${[...taskIds].join(', ')}`);
+
+            // -------------------------------------------------
+            // 2. Validate each task ID via ClickUp API
+            // -------------------------------------------------
+            const apiToken = process.env.CLICKUP_API_TOKEN;
+            const expectedSpaceId = process.env.CLICKUP_SPACE_ID;
+
+            if (!apiToken) {
+              core.setFailed('❌ CLICKUP_API_TOKEN secret is not configured. Please add it to the repo secrets.');
+              return;
+            }
+
+            let allValid = true;
+            const results = [];
+
+            for (const taskId of taskIds) {
+              console.log(`\nValidating task: ${taskId}...`);
+
+              try {
+                const response = await fetch(`https://api.clickup.com/api/v2/task/${taskId}`, {
+                  headers: {
+                    'Authorization': apiToken,
+                    'Content-Type': 'application/json'
+                  }
+                });
+
+                if (!response.ok) {
+                  const errorBody = await response.text();
+                  console.log(`API returned ${response.status}: ${errorBody}`);
+                  results.push(`❌ Task \`${taskId}\` — Not found or invalid (HTTP ${response.status})`);
+                  allValid = false;
+                  continue;
+                }
+
+                const task = await response.json();
+                const taskName = task.name;
+                const taskStatus = task.status?.status || 'unknown';
+                const taskSpaceId = task.space?.id;
+
+                console.log(`  Name: ${taskName}`);
+                console.log(`  Status: ${taskStatus}`);
+                console.log(`  Space ID: ${taskSpaceId} (expected: ${expectedSpaceId})`);
+
+                // Validate space ID matches
+                if (taskSpaceId !== expectedSpaceId) {
+                  results.push(
+                    `❌ Task \`${taskId}\` ("${taskName}") belongs to space ${taskSpaceId}, ` +
+                    `but this repo requires space ${expectedSpaceId}.`
+                  );
+                  allValid = false;
+                  continue;
+                }
+
+                results.push(`✅ Task \`${taskId}\` — "${taskName}" (Status: ${taskStatus})`);
+
+              } catch (error) {
+                console.log(`Error validating task ${taskId}: ${error.message}`);
+                results.push(`❌ Task \`${taskId}\` — API error: ${error.message}`);
+                allValid = false;
+              }
+            }
+
+            // -------------------------------------------------
+            // 3. Report results
+            // -------------------------------------------------
+            console.log('\n=== Validation Results ===');
+            results.forEach(r => console.log(r));
+
+            if (!allValid) {
+              core.setFailed(
+                '❌ ClickUp task validation failed.\n\n' +
+                results.join('\n') +
+                '\n\nPlease ensure the PR description contains a valid ClickUp task ID ' +
+                'that belongs to the correct space.'
+              );
+            } else {
+              console.log('\n🎉 All ClickUp tasks validated successfully!');
+              core.info('✅ PR is linked to a valid ClickUp task. Merge gate passed.');
+            }
