@@ -362,3 +362,4 @@ pkill -f "main.py"; sleep 1 && rm -f .cxbot_cursor cxbot_assigner_state.json && 
 - Claude-powered log analysis
 - KYC verification category added
 # Test change - no clickup task
+
