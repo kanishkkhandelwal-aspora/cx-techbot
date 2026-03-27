@@ -2,7 +2,7 @@
 
 Copy everything below the line and use it as your prompt to build Phase 1.
 
----
+--------
 
 ## Context
 
