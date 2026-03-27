@@ -40,10 +40,10 @@ jobs:
             const patterns = [
               // Full ClickUp URL — extract task ID from the end
               /https?:\/\/app\.clickup\.com\/t\/([a-z0-9]+)/gi,
-              // CU- prefixed format
-              /CU-([a-z0-9]+)/gi,
-              // Explicit label patterns: "ClickUp: <id>" or "ClickUp-ID: <id>" or "Task: <id>"
-              /(?:clickup|clickup[- ]?id|task)\s*[:=]\s*#?([a-z0-9]{6,})/gi,
+              // CU- prefixed format (task IDs always start with a digit)
+              /CU-([0-9][a-z0-9]+)/gi,
+              // Explicit label patterns: "ClickUp: <id>" or "ClickUp-ID: <id>"
+              /(?:clickup|clickup[- ]?id)\s*[:=]\s*#?([0-9][a-z0-9]{5,})/gi,
             ];
 
             const taskIds = new Set();
